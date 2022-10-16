@@ -58,6 +58,7 @@ using block = std::bitset<32>;
 using half_block = std::bitset<16>;
 using byte = std::bitset<8>;
 using four_bits = std::bitset<4>;
+
 constexpr static half_block operator""_hb(unsigned long long v) {
     return half_block{static_cast<std::uint16_t>(v)};
 }
@@ -198,13 +199,31 @@ using tuple_transform_t = typename tuple_transform<T>::type;
 
 template <typename T> struct needs_round_key : std::bool_constant<true> {};
 template <> struct needs_round_key<t> : std::bool_constant<false> {};
+
+template <typename Mode> struct base_mode {
+    [[nodiscard]] block encrypt(const block b) const {
+        return static_cast<const Mode *>(this)->encrypt_impl(b);
+    }
+};
+
+template <typename Encryption,typename Counter> struct ctr_mode : base_mode<ctr_mode<Encryption,Counter>> {
+    Counter ctr_;
+    Encryption enc_;
+    explicit ctr_mode(Encryption &&enc, Counter &&ctr)
+        : ctr_{std::forward<Counter>(ctr)},
+          enc_{std::forward<Encryption>(enc)}
+    {}
+
+    [[nodiscard]] block encrypt_impl(const block b) const { return b^enc_(ctr_()); }
+};
+
 template <class... RoundActions> struct cryptosystem {
     using round_operations = std::tuple<RoundActions...>;
     using round_keys = tuple_transform_t<round_operations>;
     using rounds = decltype(tuple_zip(std::declval<round_operations>(),
                                       std::declval<round_keys>()));
     round_operations round_operations_{};
-    round_keys keys_;
+    round_keys keys_;   
     rounds rounds_;
     block encrypt(block b) {
         auto assign = [&b](auto &&val) { b = val; };
@@ -213,15 +232,15 @@ template <class... RoundActions> struct cryptosystem {
             rounds_);
         return b;
     }
-    template <typename InIt>
-    void encrypt(InIt beg, InIt end) {
+    template <typename InIt,typename Mode>
+    void encrypt(InIt beg, InIt end,const base_mode<Mode>& mode) {
         while (beg != end) {
-            *beg= encrypt(*beg);
+            *beg= mode.encrypt(*beg);
             ++beg;
         }
     }
     template <typename... Keys>
-    cryptosystem(Keys... keys)
+    explicit cryptosystem(Keys... keys)
         : keys_{keys...}, rounds_{tuple_zip(round_operations_, keys_)} {
         static_assert(std::tuple_size_v<list_rename_as_t<
                 filter<needs_round_key, RoundActions...>, std::tuple>>,
@@ -276,12 +295,12 @@ std::vector<block> read_from_file(const fs::path &p) {
     return ret;
 }
 int main() {
-    // k2<2 (k1^18431)|(k2<12) k1^9311 (k1^3328)|(k2<15)
+    
     std::vector<block> encrypted;
     for (auto i =1;i<=10;i++)
     {
         constexpr auto _ = no_key_required{};
-         auto data = read_from_file(std::format("C:\\test_cases\\test{}.in",i));
+        auto data = read_from_file(std::format("C:\\test_cases\\test{}.in",i));
         auto &&[k1, k2] = halve(read_key(std::format("C:\\test_cases\\key{}.in",i)));
         cryptosystem<l, s,t,f,f> sys{
             rotl(k2,14),
@@ -289,8 +308,15 @@ int main() {
             _,
             k1,
             k2};
-    
-        sys.encrypt(std::begin(data), std::end(data));
+        //pass block here
+        auto counter = [iv = read_key("")]() mutable
+        {
+            iv = (340660715*iv.to_ulong() + 535838461);
+            return iv;
+        };
+        auto mode = ctr_mode(
+            [&sys](auto&& block) { return sys.encrypt(block); }, std::ref(counter));
+        sys.encrypt(std::begin(data), std::end(data),mode);
         std::ofstream out{std::format("C:\\test_results\\test{}.out",i), std::ios::binary};
         std::vector<std::uint32_t> binary_out;
         std::ranges::transform(data,
